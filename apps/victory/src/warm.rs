@@ -1,7 +1,7 @@
 //! `victory warm`: host pipelines made ahead of a run (`known_pipelines`), in
 //! processes of their own: a compiler that crashes or hangs costs one pipeline.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -31,40 +31,59 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     if let Some(these) = these {
         return make(&dir, &these);
     }
+    known::use_translations(dir.with_file_name("shaders"));
+    warm(&dir, &known::fingerprint(), jobs, limit, again, used, start_worker)
+}
+
+fn warm(
+    dir: &Path,
+    fingerprint: &str,
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    start_worker: impl Fn(&[usize]) -> Result<Child> + Sync,
+) -> Result<()> {
     let began = Instant::now();
-    victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
-    let fingerprint = known::fingerprint();
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
-    let keys = known::keys(&dir);
+    let keys = known::keys(dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
-    let mut done: HashSet<&str> = HashSet::new();
-    for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
+    // Old "<fingerprint> <key>" records included refusals. Only explicit
+    // outcomes count, and a later --again attempt supersedes an earlier one.
+    let mut history = HashMap::new();
+    for (attempt, line) in listed.lines().enumerate() {
+        let mut fields = line.split(' ');
+        if fields.next() == Some(fingerprint)
+            && let (Some(status @ ("made" | "refused")), Some(key), None) =
+                (fields.next(), fields.next(), fields.next())
         {
-            done.insert(key);
+            history.insert(key, (status == "made", attempt));
         }
     }
     let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
-    // Those earlier runs drew with first, the others in no order (by key).
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
+            (again || !matches!(history.get(key), Some((true, _)))) && !bad.contains(key) && (!used || early.contains(key))
         })
         .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    // Untried keys first (used ones first among those), then the oldest
+    // attempts. Even repeated --limit 1 runs reach every persistent refusal.
+    all.sort_by_key(|&n| {
+        let key = keys[n].as_str();
+        (history.get(key).map(|&(_, attempt)| attempt), !early.contains(key), key)
+    });
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
         "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
         keys.len(),
-        done.len(),
+        history.values().filter(|(made, _)| *made).count(),
         bad.len(),
         all.len()
     );
@@ -83,13 +102,19 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             }
             let mut state = lock(&state);
             state.0.push(ms);
-            state.1 += usize::from(!there);
+            if !there {
+                if state.1 == 0 {
+                    println!("pipeline {n} {} has no host pipeline. Rerun `victory warm --these {n}` for worker diagnostics.", keys[n]);
+                }
+                state.1 += 1;
+            }
             let count = state.0.len();
             if count.is_multiple_of(1000) {
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
-            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+            let status = if there { "made" } else { "refused" };
+            let _ = writeln!(lock(&done_out), "{fingerprint} {status} {}", keys[n]);
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
@@ -101,8 +126,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
-        "{} made in {:.0} s ({refused} have no host pipeline, {crashed} ended their process); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
-        times.len(),
+        "{} made in {:.0} s, {refused} have no host pipeline, {crashed} ended their process; ms per reported attempt: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
+        times.len() - refused,
         began.elapsed().as_secs_f64(),
         at(0.5),
         at(0.9),
@@ -261,6 +286,31 @@ mod tests {
             .stdout(stdout)
             .stderr(Stdio::null())
             .spawn()?)
+    }
+
+    #[test]
+    fn used_refusals_are_retried_until_a_host_pipeline_is_made() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path();
+        let entries: Vec<u8> = [0x11, 0x22, 0x33].into_iter()
+            .flat_map(|byte| 16u32.to_le_bytes().into_iter().chain([byte; 16]))
+            .collect();
+        std::fs::write(dir.join("known-pipelines.bin"), entries)?;
+        let keys = known::keys(dir);
+        std::fs::write(dir.join("early-pipelines.txt"), keys[..2].join("\n"))?;
+        std::fs::write(dir.join("warm-done.txt"), format!("fp {}\nother made {}\n", keys[0], keys[1]))?;
+
+        // Both keys refuse at first. A second refusal of key 0 must still
+        // give key 1 its turn, and once key 1 succeeds only key 0 remains.
+        for (key, made) in [(0, 0), (1, 0), (0, 0), (1, 1), (0, 1)] {
+            warm(dir, "fp", Some(1), Some(1), false, true, |batch| {
+                assert_eq!(batch, [key]);
+                fake_child(&format!("echo made {key} 1 {made}"), Stdio::piped())
+            })?;
+        }
+        let records = std::fs::read_to_string(dir.join("warm-done.txt"))?;
+        assert_eq!(records.lines().filter(|l| l.starts_with("fp made ")).count(), 2);
+        warm(dir, "fp", Some(1), None, false, true, |_| panic!("both used pipelines were made"))
     }
 
     #[test]
