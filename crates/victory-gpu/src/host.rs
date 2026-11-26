@@ -8950,6 +8950,15 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
+    /// Whether the direct queue has actually reached its last submission.
+    /// A failed signal or wait can return to the caller before that happens.
+    pub(crate) fn submitted_work_complete(&self) -> bool {
+        let Ok(target) = self.submitted.try_lock() else { return false };
+        // SAFETY: a query of our live fence. Removal reports u64::MAX.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        completed != u64::MAX && completed >= *target
+    }
+
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
     /// given memory ahead of the list that uploads them).
